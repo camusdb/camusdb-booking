@@ -2,6 +2,8 @@
 
 A Next.js flight-booking demo on **CamusDB** and the [`camusdb`](https://www.npmjs.com/package/camusdb) TypeScript connector. It holds fake airline inventory in serializable transactions, with idempotent PNRs, last-seat races, copy-on-write branches, time-travel reads, and recoverable drops.
 
+<img width="995" height="869" alt="booking" src="https://github.com/user-attachments/assets/543c68e8-5b7e-4543-bf83-f46a808c5e71" />
+
 ## Prerequisites
 
 - Node.js 20.11 or later
