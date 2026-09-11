@@ -1,0 +1,26 @@
+{
+  "name": "camusdb-booking",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sample Next.js flight-booking app on CamusDB",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "lint": "next lint",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "camusdb": "^0.1.0",
+    "next": "^15.5.9",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^5.0.0"
+  }
+}
