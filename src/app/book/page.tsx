@@ -62,6 +62,16 @@ export default function BookPage() {
     return () => clearTimeout(timer);
   }, [booking]);
 
+  // A key names one booking request. Other details, or a new attempt after a failed payment, need a new
+  // key, or the server answers with the earlier booking or refuses the mismatch.
+  useEffect(() => {
+    setIdempotencyKey(newKey());
+  }, [passengerId, flightId, seats, paymentMethod]);
+
+  useEffect(() => {
+    if (booking?.status === 'payment_failed') setIdempotencyKey(newKey());
+  }, [booking?.status]);
+
   async function submit() {
     setBusy(true);
     setError(null);

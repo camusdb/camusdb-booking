@@ -221,3 +221,23 @@ it('refuses to cancel a booking while its payment is in progress', async ({ skip
   const booking = await book(await newFlight(1));
   await expect(cancelBooking(booking.id)).rejects.toMatchObject({ status: 409 });
 });
+
+it('refuses an idempotency key sent again with another card', async ({ skip }) => {
+  if (!available) skip();
+  await bootstrap();
+  const flightId = await newFlight(2);
+  const passengerId = (await listPassengers())[0]!.id;
+  const idempotencyKey = `card-${crypto.randomUUID()}`;
+
+  const first = await createBooking({ flightId, passengerId, seats: 1, idempotencyKey, paymentMethod: 'pm_card_chargeDeclined' });
+  const replay = await createBooking({ flightId, passengerId, seats: 1, idempotencyKey, paymentMethod: 'pm_card_chargeDeclined' });
+  expect(replay.id).toBe(first.id);
+
+  await expect(
+    createBooking({ flightId, passengerId, seats: 1, idempotencyKey, paymentMethod: 'pm_card_visa' }),
+  ).rejects.toMatchObject({ status: 422 });
+  await expect(createBooking({ flightId, passengerId, seats: 2, idempotencyKey, paymentMethod: 'pm_card_chargeDeclined' })).rejects.toMatchObject({
+    status: 422,
+  });
+  expect((await getFlight(flightId))?.seatsAvailable).toBe(1);
+});

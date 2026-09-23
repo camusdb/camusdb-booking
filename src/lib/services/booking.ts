@@ -7,7 +7,7 @@ import { enqueue } from '../outbox/outbox';
 import { wakeRelay } from '../outbox/relay';
 import { paymentMethods } from '../payments/gateway';
 import { findPayment } from './payments';
-import type { Booking, BookingDetail, CreateBookingRequest, Flight, Passenger } from '../types';
+import type { Booking, BookingDetail, CreateBookingRequest, Flight, Passenger, PaymentMethod } from '../types';
 
 const PNR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -70,6 +70,36 @@ async function findByIdempotencyKey(
   return row ? mapBooking(row) : undefined;
 }
 
+/**
+ * Returns the booking that an earlier request with this key made. A key identifies one request, so a
+ * key sent again with other parameters is refused instead of answered with a booking the caller did not
+ * ask for. Seed bookings have no payment row, so their payment method is not compared.
+ */
+async function replayFor(
+  client: CamusClient,
+  request: CreateBookingRequest,
+  paymentMethod: PaymentMethod,
+  key: string,
+  transaction?: CamusTransaction,
+): Promise<Booking | undefined> {
+  const existing = await findByIdempotencyKey(client, key, transaction);
+  if (!existing) return undefined;
+
+  const payment = await findPayment(client, existing.id, transaction);
+  const same =
+    existing.passengerId === request.passengerId &&
+    existing.flightId === request.flightId &&
+    existing.seats === request.seats &&
+    (!payment || payment.paymentMethod === paymentMethod);
+  if (!same) {
+    throw new HttpError(
+      422,
+      `Idempotency key ${key} was already used for a different booking request (PNR ${existing.pnr}). Use a new key.`,
+    );
+  }
+  return existing;
+}
+
 export async function createBooking(request: CreateBookingRequest): Promise<Booking> {
   if (!Number.isInteger(request.seats) || request.seats <= 0) {
     throw new HttpError(400, 'Seat count must be a positive integer.');
@@ -82,7 +112,7 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
   const idempotencyKey = request.idempotencyKey?.trim() || crypto.randomUUID().replaceAll('-', '');
   const client = getClient();
 
-  const existing = await findByIdempotencyKey(client, idempotencyKey);
+  const existing = await replayFor(client, request, paymentMethod, idempotencyKey);
   if (existing) return existing;
 
   try {
@@ -90,7 +120,7 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
     await using txn = await client.beginTransaction();
 
     try {
-      const replay = await findByIdempotencyKey(client, idempotencyKey, txn);
+      const replay = await replayFor(client, request, paymentMethod, idempotencyKey, txn);
       if (replay) {
         await txn.rollback();
         return replay;
@@ -210,7 +240,7 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
     });
   } catch (error) {
     if (isUniqueViolation(error)) {
-      const booking = await findByIdempotencyKey(client, idempotencyKey);
+      const booking = await replayFor(client, request, paymentMethod, idempotencyKey);
       if (booking) return booking;
     }
     throw error;
