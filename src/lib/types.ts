@@ -1,6 +1,12 @@
 export type FlightStatus = 'scheduled' | 'boarding' | 'departed' | 'cancelled';
-export type BookingStatus = 'confirmed' | 'cancelled';
-export type FailurePoint = 'afterRead' | 'afterSeatHold' | 'beforeEventInsert' | 'beforeCommit';
+export type BookingStatus = 'pending_payment' | 'confirmed' | 'payment_failed' | 'cancelled';
+export type FailurePoint = 'afterRead' | 'afterSeatHold' | 'beforeEventInsert' | 'beforeOutboxInsert' | 'beforeCommit';
+export type PaymentStatus = 'pending' | 'succeeded' | 'failed' | 'refund_pending' | 'refunded';
+export type OutboxStatus = 'pending' | 'sent' | 'dead';
+export type OutboxTopic = 'payment.requested' | 'refund.requested';
+
+/** Test payment methods, named after the Stripe test cards they copy. */
+export type PaymentMethod = 'pm_card_visa' | 'pm_card_chargeDeclined' | 'pm_card_chargeDeclinedInsufficientFunds';
 
 export interface Passenger {
   id: string;
@@ -50,6 +56,7 @@ export interface CreateBookingRequest {
   flightId: string;
   seats: number;
   idempotencyKey?: string;
+  paymentMethod?: PaymentMethod;
 }
 
 export interface BranchInfo {
@@ -92,6 +99,50 @@ export interface FailureInjectionResult {
   seatsBefore: number;
   seatsAfter: number;
   eventsCreated: number;
+  outboxCreated: number;
+}
+
+export interface Payment {
+  id: string;
+  bookingId: string;
+  intentId: string;
+  amount: number;
+  paymentMethod: PaymentMethod;
+  status: PaymentStatus;
+  failureReason: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OutboxMessage {
+  id: string;
+  aggregateId: string;
+  topic: OutboxTopic;
+  payload: string;
+  status: OutboxStatus;
+  attempts: number;
+  nextAttemptAt: string;
+  lastError: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RelayState {
+  running: boolean;
+  paused: boolean;
+  crashAfterPublish: boolean;
+  lastTickAt: string | null;
+  lastError: string | null;
+  published: number;
+}
+
+export interface OutboxOverview {
+  relay: RelayState;
+  messages: OutboxMessage[];
+}
+
+export interface BookingDetail extends Booking {
+  payment: Payment | null;
 }
 
 export interface CamusHealth {

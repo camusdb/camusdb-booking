@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import PaymentsLab from '@/components/PaymentsLab';
 import { api, getDatabase, setDatabase } from '@/lib/client/api';
 import type {
   BranchInfo,
@@ -14,7 +15,7 @@ import type {
   Passenger,
 } from '@/lib/types';
 
-const failurePoints: FailurePoint[] = ['afterRead', 'afterSeatHold', 'beforeEventInsert', 'beforeCommit'];
+const failurePoints: FailurePoint[] = ['afterRead', 'afterSeatHold', 'beforeEventInsert', 'beforeOutboxInsert', 'beforeCommit'];
 
 export default function LabPage() {
   const [health, setHealth] = useState<CamusHealth | null>(null);
@@ -68,7 +69,7 @@ export default function LabPage() {
       <div className="eyebrow">Operator tools</div>
       <h2>CamusDB Lab</h2>
       <p className="lede">
-        Current database: <strong>{current}</strong>. Branch, race the last seats, inject a failure, and recover an orphan table.
+        Current database: <strong>{current}</strong>. Branch, race the last seats, inject a failure, break the payment path, and recover an orphan table.
       </p>
       {error && <div className="alert error">{error}</div>}
       {message && <div className="alert">{message}</div>}
@@ -135,7 +136,7 @@ export default function LabPage() {
 
         <section className="panel">
           <h3>Concurrent booking</h3>
-          <p className="muted">Many clients take one seat on the same flight. Only remaining inventory should commit.</p>
+          <p className="muted">Many clients take one seat on the same flight. Only remaining inventory should commit. Each hold then waits for its payment.</p>
           <label>
             Flight
             <select value={flightId} onChange={(event) => setFlightId(event.target.value)}>
@@ -221,7 +222,7 @@ export default function LabPage() {
           </div>
           {failure && (
             <div className="alert">
-              Rolled back: {String(failure.rolledBack)}. Seats {failure.seatsBefore} → {failure.seatsAfter}. New events: {failure.eventsCreated}.
+              Rolled back: {String(failure.rolledBack)}. Seats {failure.seatsBefore} → {failure.seatsAfter}. New events: {failure.eventsCreated}. New outbox messages: {failure.outboxCreated}.
             </div>
           )}
         </section>
@@ -297,6 +298,8 @@ export default function LabPage() {
           ))}
         </section>
       </div>
+
+      <PaymentsLab onChange={() => reload().catch((err: Error) => setError(err.message))} />
 
       <section className="panel" style={{ marginTop: 16 }}>
         <h3>EXPLAIN</h3>

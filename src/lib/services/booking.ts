@@ -3,7 +3,11 @@ import { getClient } from '../camus/client';
 import { maybeFail } from '../camus/context';
 import { bookingSelect, flightSelect, mapBooking, mapFlight, mapPassenger, type BookingRow, type FlightRow, type PassengerRow } from '../camus/map';
 import { HttpError, isUniqueViolation } from '../errors';
-import type { Booking, CreateBookingRequest, Flight, Passenger } from '../types';
+import { enqueue } from '../outbox/outbox';
+import { wakeRelay } from '../outbox/relay';
+import { paymentMethods } from '../payments/gateway';
+import { findPayment } from './payments';
+import type { Booking, BookingDetail, CreateBookingRequest, Flight, Passenger } from '../types';
 
 const PNR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -46,6 +50,13 @@ export async function listBookings(flightId?: string): Promise<Booking[]> {
   return rows.map(mapBooking);
 }
 
+export async function getBooking(id: string): Promise<BookingDetail | undefined> {
+  const client = getClient();
+  const row = await client.queryOne<BookingRow>(`${bookingSelect} WHERE id = @id`, { id: camus.id(id) });
+  if (!row) return undefined;
+  return { ...mapBooking(row), payment: (await findPayment(client, id)) ?? null };
+}
+
 async function findByIdempotencyKey(
   client: CamusClient,
   key: string,
@@ -62,6 +73,10 @@ async function findByIdempotencyKey(
 export async function createBooking(request: CreateBookingRequest): Promise<Booking> {
   if (!Number.isInteger(request.seats) || request.seats <= 0) {
     throw new HttpError(400, 'Seat count must be a positive integer.');
+  }
+  const paymentMethod = request.paymentMethod ?? 'pm_card_visa';
+  if (!paymentMethods.includes(paymentMethod)) {
+    throw new HttpError(400, `Unknown payment method ${paymentMethod}.`);
   }
 
   const idempotencyKey = request.idempotencyKey?.trim() || crypto.randomUUID().replaceAll('-', '');
@@ -125,10 +140,27 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
           flight_id: camus.id(request.flightId),
           seats: request.seats,
           total: camus.float64(total),
-          status: 'confirmed',
+          status: 'pending_payment',
           pnr,
           idempotency_key: idempotencyKey,
           created_at: now,
+        },
+        { transaction: txn },
+      );
+
+      const paymentId = CamusObjectId.generateAsString();
+      await client.insert(
+        'payments',
+        {
+          id: camus.id(paymentId),
+          booking_id: camus.id(bookingId),
+          intent_id: '',
+          amount: camus.float64(total),
+          payment_method: paymentMethod,
+          status: 'pending',
+          failure_reason: '',
+          created_at: now,
+          updated_at: now,
         },
         { transaction: txn },
       );
@@ -146,16 +178,27 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
         },
         { transaction: txn },
       );
+      maybeFail('beforeOutboxInsert');
+
+      await enqueue(client, txn, 'payment.requested', bookingId, {
+        bookingId,
+        paymentId,
+        pnr,
+        amountCents: Math.round(total * 100),
+        currency: 'usd',
+        paymentMethod,
+      });
       maybeFail('beforeCommit');
 
       await txn.commit();
+      wakeRelay();
       return {
         id: bookingId,
         passengerId: request.passengerId,
         flightId: request.flightId,
         seats: request.seats,
         total,
-        status: 'confirmed',
+        status: 'pending_payment',
         pnr,
         idempotencyKey,
         createdAt: now.toISOString(),
@@ -187,6 +230,10 @@ export async function cancelBooking(id: string): Promise<Booking> {
     );
     if (!booking) throw new HttpError(404, 'Booking not found.');
     if (booking.status === 'cancelled') throw new HttpError(400, 'Booking is already cancelled.');
+    if (booking.status === 'pending_payment') {
+      throw new HttpError(409, 'The payment for this booking is still in progress. Try again when it completes.');
+    }
+    if (booking.status !== 'confirmed') throw new HttpError(400, `A ${booking.status} booking cannot be cancelled.`);
 
     const flight = await client.queryOne<FlightRow>(
       `${flightSelect} WHERE id = @id`,
@@ -219,7 +266,25 @@ export async function cancelBooking(id: string): Promise<Booking> {
       { transaction: txn },
     );
 
+    // A paid booking gets its money back through the outbox, in the same transaction as the cancel.
+    const payment = await findPayment(client, id, txn);
+    const refunding = payment?.status === 'succeeded';
+    if (payment && refunding) {
+      await client.execute(
+        'UPDATE payments SET status = @status, updated_at = @now WHERE id = @id',
+        { status: 'refund_pending', now: new Date(), id: camus.id(payment.id) },
+        { transaction: txn },
+      );
+      await enqueue(client, txn, 'refund.requested', id, {
+        bookingId: id,
+        paymentId: payment.id,
+        intentId: payment.intentId,
+        amountCents: Math.round(payment.amount * 100),
+      });
+    }
+
     await txn.commit();
+    if (refunding) wakeRelay();
     return { ...mapBooking(booking), status: 'cancelled' };
   } catch (error) {
     await txn.rollback();

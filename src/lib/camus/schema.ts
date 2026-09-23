@@ -58,6 +58,43 @@ const ddl = [
   'CREATE INDEX booking_events_flight_id_idx ON booking_events (flight_id)',
   'CREATE INDEX booking_events_created_at_idx ON booking_events (created_at)',
   `
+  CREATE TABLE payments (
+    id OID PRIMARY KEY NOT NULL,
+    booking_id OID NOT NULL,
+    intent_id STRING NOT NULL,
+    amount FLOAT64 NOT NULL,
+    payment_method STRING NOT NULL,
+    status STRING NOT NULL,
+    failure_reason STRING NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+  )
+  `,
+  'CREATE UNIQUE INDEX payments_booking_id_idx ON payments (booking_id)',
+  `
+  CREATE TABLE outbox (
+    id OID PRIMARY KEY NOT NULL,
+    aggregate_id OID NOT NULL,
+    topic STRING NOT NULL,
+    payload STRING NOT NULL,
+    status STRING NOT NULL,
+    attempts INT64 NOT NULL,
+    next_attempt_at DATETIME NOT NULL,
+    last_error STRING NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+  )
+  `,
+  'CREATE INDEX outbox_status_idx ON outbox (status)',
+  'CREATE INDEX outbox_created_at_idx ON outbox (created_at)',
+  `
+  CREATE TABLE processed_webhooks (
+    event_id STRING PRIMARY KEY NOT NULL,
+    event_type STRING NOT NULL,
+    received_at DATETIME NOT NULL
+  )
+  `,
+  `
   CREATE TABLE app_metadata (
     meta_key STRING PRIMARY KEY NOT NULL,
     value STRING NOT NULL

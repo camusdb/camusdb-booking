@@ -36,7 +36,7 @@ it('creates a booking and holds seats', async ({ skip }) => {
   });
 
   expect(booking.pnr).toHaveLength(6);
-  expect(booking.status).toBe('confirmed');
+  expect(booking.status).toBe('pending_payment');
 
   const after = (await listFlights()).find((row) => row.id === flight!.id);
   expect(after?.seatsAvailable).toBe(before - 1);

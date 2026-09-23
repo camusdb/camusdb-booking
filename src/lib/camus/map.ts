@@ -1,5 +1,5 @@
 import { asNumber, toIso } from '../errors';
-import type { Booking, BookingEvent, Flight, Passenger } from '../types';
+import type { Booking, BookingEvent, Flight, OutboxMessage, Passenger, Payment } from '../types';
 
 export interface PassengerRow {
   id: string;
@@ -42,6 +42,31 @@ export interface EventRow {
   event_type: string;
   seats: number | bigint;
   created_at: Date | string;
+}
+
+export interface PaymentRow {
+  id: string;
+  booking_id: string;
+  intent_id: string;
+  amount: number;
+  payment_method: string;
+  status: string;
+  failure_reason: string;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+export interface OutboxRow {
+  id: string;
+  aggregate_id: string;
+  topic: string;
+  payload: string;
+  status: string;
+  attempts: number | bigint;
+  next_attempt_at: Date | string;
+  last_error: string;
+  created_at: Date | string;
+  updated_at: Date | string;
 }
 
 export function mapPassenger(row: PassengerRow): Passenger {
@@ -91,6 +116,35 @@ export function mapEvent(row: EventRow): BookingEvent {
   };
 }
 
+export function mapPayment(row: PaymentRow): Payment {
+  return {
+    id: row.id,
+    bookingId: row.booking_id,
+    intentId: row.intent_id,
+    amount: row.amount,
+    paymentMethod: row.payment_method as Payment['paymentMethod'],
+    status: row.status as Payment['status'],
+    failureReason: row.failure_reason,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
+export function mapOutbox(row: OutboxRow): OutboxMessage {
+  return {
+    id: row.id,
+    aggregateId: row.aggregate_id,
+    topic: row.topic as OutboxMessage['topic'],
+    payload: row.payload,
+    status: row.status as OutboxMessage['status'],
+    attempts: asNumber(row.attempts),
+    nextAttemptAt: toIso(row.next_attempt_at),
+    lastError: row.last_error,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
+  };
+}
+
 export const flightSelect = `
   SELECT id, flight_number, airline, origin, destination, departs_at, arrives_at,
          cabin, fare, seats_total, seats_available, status, created_at
@@ -100,4 +154,14 @@ export const flightSelect = `
 export const bookingSelect = `
   SELECT id, passenger_id, flight_id, seats, total, status, pnr, idempotency_key, created_at
   FROM bookings
+`;
+
+export const paymentSelect = `
+  SELECT id, booking_id, intent_id, amount, payment_method, status, failure_reason, created_at, updated_at
+  FROM payments
+`;
+
+export const outboxSelect = `
+  SELECT id, aggregate_id, topic, payload, status, attempts, next_attempt_at, last_error, created_at, updated_at
+  FROM outbox
 `;

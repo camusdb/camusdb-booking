@@ -2,7 +2,20 @@
 
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/client/api';
-import type { Booking, Flight, IdempotencyDemoResult, Passenger } from '@/lib/types';
+import type { Booking, BookingDetail, Flight, IdempotencyDemoResult, Passenger, PaymentMethod } from '@/lib/types';
+
+const cards: { value: PaymentMethod; label: string }[] = [
+  { value: 'pm_card_visa', label: 'Visa · succeeds' },
+  { value: 'pm_card_chargeDeclined', label: 'Visa · declined' },
+  { value: 'pm_card_chargeDeclinedInsufficientFunds', label: 'Visa · insufficient funds' },
+];
+
+const statusText: Record<Booking['status'], string> = {
+  pending_payment: 'seats held · waiting for payment',
+  confirmed: 'confirmed · payment captured',
+  payment_failed: 'payment failed · seats released',
+  cancelled: 'cancelled',
+};
 
 function newKey(): string {
   return crypto.randomUUID().replaceAll('-', '');
@@ -15,7 +28,8 @@ export default function BookPage() {
   const [passengerId, setPassengerId] = useState('');
   const [seats, setSeats] = useState(1);
   const [idempotencyKey, setIdempotencyKey] = useState(newKey);
-  const [booking, setBooking] = useState<Booking | null>(null);
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('pm_card_visa');
+  const [booking, setBooking] = useState<BookingDetail | null>(null);
   const [idempotency, setIdempotency] = useState<IdempotencyDemoResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -37,17 +51,27 @@ export default function BookPage() {
       .catch((err: Error) => setError(err.message));
   }, []);
 
+  // The payment completes after the booking returns, so ask for the booking until it leaves pending.
+  useEffect(() => {
+    if (!booking || booking.status !== 'pending_payment') return;
+    const timer = setTimeout(() => {
+      api<BookingDetail>(`/api/bookings/${booking.id}`)
+        .then(setBooking)
+        .catch((err: Error) => setError(err.message));
+    }, 750);
+    return () => clearTimeout(timer);
+  }, [booking]);
+
   async function submit() {
     setBusy(true);
     setError(null);
     setIdempotency(null);
     try {
-      setBooking(
-        await api<Booking>('/api/bookings', {
-          method: 'POST',
-          body: JSON.stringify({ flightId, passengerId, seats, idempotencyKey }),
-        }),
-      );
+      const created = await api<Booking>('/api/bookings', {
+        method: 'POST',
+        body: JSON.stringify({ flightId, passengerId, seats, idempotencyKey, paymentMethod }),
+      });
+      setBooking({ ...created, payment: null });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Booking failed');
     } finally {
@@ -62,7 +86,7 @@ export default function BookPage() {
       setIdempotency(
         await api<IdempotencyDemoResult>('/api/demo/idempotency?requestCount=3', {
           method: 'POST',
-          body: JSON.stringify({ flightId, passengerId, seats, idempotencyKey }),
+          body: JSON.stringify({ flightId, passengerId, seats, idempotencyKey, paymentMethod }),
         }),
       );
     } catch (err) {
@@ -77,8 +101,10 @@ export default function BookPage() {
       <div className="eyebrow">Hold inventory</div>
       <h2>Book a seat</h2>
       <p className="lede">
-        A booking decrements remaining seats inside one CamusDB transaction, then writes a PNR and a
-        reserved event. Reuse the idempotency key to retry safely.
+        A booking holds the seats, writes a PNR, a reserved event, and a payment request to the outbox,
+        all in one CamusDB transaction. The relay sends the request to the payment gateway, and the
+        gateway webhook confirms the booking or releases the seats. Reuse the idempotency key to retry
+        safely.
       </p>
 
       <div className="panel" style={{ marginTop: 24, maxWidth: 560 }}>
@@ -108,13 +134,23 @@ export default function BookPage() {
             <input type="number" min={1} value={seats} onChange={(event) => setSeats(Number(event.target.value))} />
           </label>
           <label>
+            Card
+            <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value as PaymentMethod)}>
+              {cards.map((card) => (
+                <option key={card.value} value={card.value}>
+                  {card.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             Idempotency key
             <input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} />
           </label>
         </div>
         <div className="stack">
           <button className="primary" onClick={submit} disabled={busy}>
-            Confirm booking
+            Book and pay
           </button>
           <button className="ghost" onClick={() => setIdempotencyKey(newKey())}>
             New key
@@ -125,7 +161,10 @@ export default function BookPage() {
         </div>
         {booking && (
           <div className="alert">
-            PNR {booking.pnr} confirmed · {booking.seats} seat{booking.seats === 1 ? '' : 's'} · ${booking.total}
+            PNR {booking.pnr} {statusText[booking.status]} · {booking.seats} seat{booking.seats === 1 ? '' : 's'} · $
+            {booking.total}
+            {booking.payment?.intentId && <div className="muted">Payment intent {booking.payment.intentId}</div>}
+            {booking.payment?.failureReason && <div className="muted">Reason: {booking.payment.failureReason}</div>}
           </div>
         )}
         {idempotency && (

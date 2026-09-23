@@ -1,6 +1,7 @@
 import { getClient } from './client';
 import { getStore, runWithStore } from './context';
 import { HttpError } from '../errors';
+import { countOutbox } from '../outbox/outbox';
 import { createBooking, getFlight } from '../services/booking';
 import type {
   ConcurrentDemoResult,
@@ -62,6 +63,7 @@ export async function injectFailure(
   const before = await getFlight(request.flightId);
   if (!before) throw new HttpError(404, 'Flight not found.');
   const eventsBefore = Number((await getClient().scalar<number | bigint>('SELECT COUNT(*) FROM booking_events')) ?? 0);
+  const outboxBefore = await countOutbox();
 
   let rolledBack = false;
   try {
@@ -72,11 +74,13 @@ export async function injectFailure(
 
   const after = await getFlight(request.flightId);
   const eventsAfter = Number((await getClient().scalar<number | bigint>('SELECT COUNT(*) FROM booking_events')) ?? 0);
+  const outboxAfter = await countOutbox();
 
   return {
     rolledBack,
     seatsBefore: before.seatsAvailable,
     seatsAfter: after?.seatsAvailable ?? 0,
     eventsCreated: eventsAfter - eventsBefore,
+    outboxCreated: outboxAfter - outboxBefore,
   };
 }

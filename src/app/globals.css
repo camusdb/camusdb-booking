@@ -539,3 +539,14 @@ pre.plan {
   .flight-result-meta { justify-items: start; }
   .hero-bleed { padding-bottom: 64px; }
 }
+
+.ledger-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+.ledger { overflow-x: auto; }
+.ledger table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ledger th, .ledger td { padding: 6px 8px; text-align: left; vertical-align: top; }
+.ledger th { color: var(--muted); font-weight: 400; }
+.ledger td { border-top: 1px solid var(--wash); font-variant-numeric: tabular-nums; }
+.ledger code { font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  .ledger-grid { grid-template-columns: 1fr; }
+}
