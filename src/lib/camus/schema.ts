@@ -1,17 +1,25 @@
-import { CamusError } from 'camusdb';
 import { getClient, rootDatabase } from './client';
 
+/**
+ * The schema, as DDL that is safe to run on every start. `IF NOT EXISTS` makes each statement a
+ * no-op when its table or index is already there.
+ *
+ * - `OID` is a 12-byte ObjectId. Bind it with `camus.id(...)`: a plain string binds as `STRING`, and
+ *   the server refuses a `STRING` for an `OID` column.
+ * - `INT64` reads as a `number`, because the client sets `int64: 'number'`.
+ * - `DATETIME` reads as a JavaScript `Date`, in UTC.
+ */
 const ddl = [
   `
-  CREATE TABLE passengers (
+  CREATE TABLE IF NOT EXISTS passengers (
     id OID PRIMARY KEY NOT NULL,
     name STRING NOT NULL,
     email STRING NOT NULL
   )
   `,
-  'CREATE UNIQUE INDEX passengers_email_idx ON passengers (email)',
+  'CREATE UNIQUE INDEX IF NOT EXISTS passengers_email_idx ON passengers (email)',
   `
-  CREATE TABLE flights (
+  CREATE TABLE IF NOT EXISTS flights (
     id OID PRIMARY KEY NOT NULL,
     flight_number STRING NOT NULL,
     airline STRING NOT NULL,
@@ -27,10 +35,10 @@ const ddl = [
     created_at DATETIME NOT NULL
   )
   `,
-  'CREATE UNIQUE INDEX flights_flight_number_idx ON flights (flight_number)',
-  'CREATE INDEX flights_departs_at_idx ON flights (departs_at)',
+  'CREATE UNIQUE INDEX IF NOT EXISTS flights_flight_number_idx ON flights (flight_number)',
+  'CREATE INDEX IF NOT EXISTS flights_departs_at_idx ON flights (departs_at)',
   `
-  CREATE TABLE bookings (
+  CREATE TABLE IF NOT EXISTS bookings (
     id OID PRIMARY KEY NOT NULL,
     passenger_id OID NOT NULL,
     flight_id OID NOT NULL,
@@ -42,11 +50,13 @@ const ddl = [
     created_at DATETIME NOT NULL
   )
   `,
-  'CREATE UNIQUE INDEX bookings_idempotency_key_idx ON bookings (idempotency_key)',
-  'CREATE UNIQUE INDEX bookings_pnr_idx ON bookings (pnr)',
-  'CREATE INDEX bookings_flight_id_idx ON bookings (flight_id)',
+  // The unique index is what makes the idempotency key safe under concurrency: two requests with one
+  // key cannot both insert a booking.
+  'CREATE UNIQUE INDEX IF NOT EXISTS bookings_idempotency_key_idx ON bookings (idempotency_key)',
+  'CREATE UNIQUE INDEX IF NOT EXISTS bookings_pnr_idx ON bookings (pnr)',
+  'CREATE INDEX IF NOT EXISTS bookings_flight_id_idx ON bookings (flight_id)',
   `
-  CREATE TABLE booking_events (
+  CREATE TABLE IF NOT EXISTS booking_events (
     id OID PRIMARY KEY NOT NULL,
     booking_id OID,
     flight_id OID NOT NULL,
@@ -55,10 +65,10 @@ const ddl = [
     created_at DATETIME NOT NULL
   )
   `,
-  'CREATE INDEX booking_events_flight_id_idx ON booking_events (flight_id)',
-  'CREATE INDEX booking_events_created_at_idx ON booking_events (created_at)',
+  'CREATE INDEX IF NOT EXISTS booking_events_flight_id_idx ON booking_events (flight_id)',
+  'CREATE INDEX IF NOT EXISTS booking_events_created_at_idx ON booking_events (created_at)',
   `
-  CREATE TABLE payments (
+  CREATE TABLE IF NOT EXISTS payments (
     id OID PRIMARY KEY NOT NULL,
     booking_id OID NOT NULL,
     intent_id STRING NOT NULL,
@@ -70,9 +80,9 @@ const ddl = [
     updated_at DATETIME NOT NULL
   )
   `,
-  'CREATE UNIQUE INDEX payments_booking_id_idx ON payments (booking_id)',
+  'CREATE UNIQUE INDEX IF NOT EXISTS payments_booking_id_idx ON payments (booking_id)',
   `
-  CREATE TABLE outbox (
+  CREATE TABLE IF NOT EXISTS outbox (
     id OID PRIMARY KEY NOT NULL,
     aggregate_id OID NOT NULL,
     topic STRING NOT NULL,
@@ -85,38 +95,29 @@ const ddl = [
     updated_at DATETIME NOT NULL
   )
   `,
-  'CREATE INDEX outbox_status_idx ON outbox (status)',
-  'CREATE INDEX outbox_created_at_idx ON outbox (created_at)',
+  'CREATE INDEX IF NOT EXISTS outbox_status_idx ON outbox (status)',
+  'CREATE INDEX IF NOT EXISTS outbox_created_at_idx ON outbox (created_at)',
   `
-  CREATE TABLE processed_webhooks (
+  CREATE TABLE IF NOT EXISTS processed_webhooks (
     event_id STRING PRIMARY KEY NOT NULL,
     event_type STRING NOT NULL,
     received_at DATETIME NOT NULL
   )
   `,
   `
-  CREATE TABLE app_metadata (
+  CREATE TABLE IF NOT EXISTS app_metadata (
     meta_key STRING PRIMARY KEY NOT NULL,
     value STRING NOT NULL
   )
   `,
 ];
 
-function isBenignDdl(error: unknown): boolean {
-  if (!CamusError.is(error)) return false;
-  const message = error.message.toLowerCase();
-  return message.includes('already exists') || message.includes('duplicate');
-}
-
 export async function initializeSchema(): Promise<void> {
   const client = getClient(rootDatabase());
   await client.createDatabase(rootDatabase(), { ifNotExists: true });
 
+  // DDL runs outside any transaction, one statement at a time.
   for (const statement of ddl) {
-    try {
-      await client.executeDdl(statement);
-    } catch (error) {
-      if (!isBenignDdl(error)) throw error;
-    }
+    await client.executeDdl(statement);
   }
 }

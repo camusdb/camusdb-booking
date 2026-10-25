@@ -1,4 +1,4 @@
-import { camus, withRetry, type CamusClient, type CamusTransaction } from 'camusdb';
+import { camus, type CamusClient, type CamusTransaction } from 'camusdb';
 import { listBranches } from '../camus/admin';
 import { getClient, rootDatabase } from '../camus/client';
 import { mapOutbox, outboxSelect, type OutboxRow } from '../camus/map';
@@ -28,45 +28,25 @@ export interface ProcessOptions {
 
 /**
  * Takes up to one batch of due messages. Each claim moves `next_attempt_at` one lease ahead and counts
- * the attempt, in one transaction. Two relays that claim the same row conflict, and the loser retries
- * and no longer sees it as due.
+ * the attempt, in one transaction. Two relays that claim the same row conflict. `client.transaction`
+ * runs the loser again, and then the row is no longer due.
  */
 async function claim(client: CamusClient, now: Date): Promise<OutboxMessage[]> {
-  return withRetry(async () => {
-    await using txn = await client.beginTransaction();
-    try {
-      const { rows } = await client.query<OutboxRow>(
-        `${outboxSelect} WHERE status = 'pending' AND next_attempt_at <= @now ORDER BY created_at LIMIT ${BATCH_SIZE}`,
-        { now },
+  return client.transaction(async (txn) => {
+    const { rows } = await client.query<OutboxRow>(
+      `${outboxSelect} WHERE status = 'pending' AND next_attempt_at <= @now ORDER BY created_at LIMIT @take`,
+      { now, take: BATCH_SIZE },
+      { transaction: txn },
+    );
+    const leaseEnd = new Date(now.getTime() + LEASE_MS);
+    for (const row of rows) {
+      await client.execute(
+        'UPDATE outbox SET attempts = attempts + 1, next_attempt_at = @leaseEnd, updated_at = @now WHERE id = @id',
+        { leaseEnd, now, id: camus.id(row.id) },
         { transaction: txn },
       );
-      const leaseEnd = new Date(now.getTime() + LEASE_MS);
-      for (const row of rows) {
-        await client.execute(
-          'UPDATE outbox SET attempts = @attempts, next_attempt_at = @leaseEnd, updated_at = @now WHERE id = @id',
-          { attempts: Number(row.attempts) + 1, leaseEnd, now, id: camus.id(row.id) },
-          { transaction: txn },
-        );
-      }
-      await txn.commit();
-      return rows.map((row) => ({ ...mapOutbox(row), attempts: Number(row.attempts) + 1 }));
-    } catch (error) {
-      await txn.rollback();
-      throw error;
     }
-  });
-}
-
-async function inTransaction(client: CamusClient, work: (txn: CamusTransaction) => Promise<void>): Promise<void> {
-  await withRetry(async () => {
-    await using txn = await client.beginTransaction();
-    try {
-      await work(txn);
-      await txn.commit();
-    } catch (error) {
-      await txn.rollback();
-      throw error;
-    }
+    return rows.map((row) => ({ ...mapOutbox(row), attempts: row.attempts + 1 }));
   });
 }
 
@@ -99,7 +79,7 @@ async function publish(
       message.id,
     );
     if (crashAfterPublish()) throw new SimulatedCrash();
-    await inTransaction(client, async (txn) => {
+    await client.transaction(async (txn) => {
       await markSent(client, txn, message.id);
       await attachIntent(client, txn, payload.paymentId, intent.id);
     });
@@ -110,7 +90,7 @@ async function publish(
     const payload = JSON.parse(message.payload) as RefundRequestedPayload;
     await gateway.createRefund({ payment_intent: payload.intentId }, message.id);
     if (crashAfterPublish()) throw new SimulatedCrash();
-    await inTransaction(client, async (txn) => {
+    await client.transaction(async (txn) => {
       await markSent(client, txn, message.id);
       await completeRefund(client, txn, payload.bookingId, payload.paymentId);
     });
@@ -124,7 +104,7 @@ async function recordFailure(client: CamusClient, message: OutboxMessage, error:
   const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
   const retryable = !(error instanceof GatewayRequestError) || error.retryable;
 
-  await inTransaction(client, async (txn) => {
+  await client.transaction(async (txn) => {
     const now = new Date();
     if (retryable && message.attempts < MAX_ATTEMPTS) {
       await client.execute(

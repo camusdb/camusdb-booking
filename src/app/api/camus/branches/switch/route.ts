@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { currentDatabase } from '@/lib/camus/context';
+import { currentDatabase, rootDatabase } from '@/lib/camus/client';
 import { withCamus } from '@/lib/http';
 
 export const runtime = 'nodejs';
@@ -11,7 +11,7 @@ export function GET(request: Request) {
 export async function POST(request: Request) {
   const body = (await request.json()) as { database?: string };
   const database = body.database?.trim() || '';
-  const response = NextResponse.json({ database: database || process.env.CAMUS_DATABASE || 'camusbooking' });
+  const response = NextResponse.json({ database: database || rootDatabase() });
   if (database) {
     response.cookies.set('camus-database', database, { path: '/' });
   } else {

@@ -1,8 +1,10 @@
-import { CamusObjectId, camus } from 'camusdb';
-import { getClient } from '../camus/client';
-import { mapFlight, mapPassenger, type FlightRow, type PassengerRow } from '../camus/map';
+import { CamusObjectId, camus, type CamusClient } from 'camusdb';
+import { getClient } from './client';
+import { listFlights, listPassengers } from '../services/booking';
+import { recordEvent } from '../services/events';
 import type { SeedSummary } from '../types';
 
+/** The `app_metadata` key that marks a seeded database. */
 const SEED_KEY = 'seeded_at';
 
 const passengers = [
@@ -34,152 +36,122 @@ const flights: SeedFlight[] = [
   { flightNumber: 'PL330', airline: 'Pacific Loop', origin: 'NRT', destination: 'SFO', departOffsetHours: 26, durationHours: 9.5, cabin: 'economy', fare: 940, seats: 14 },
 ];
 
-async function isSeeded(): Promise<boolean> {
-  const row = await getClient().queryOne<{ value: string }>(
-    'SELECT value FROM app_metadata WHERE meta_key = @key',
-    { key: SEED_KEY },
-  );
-  return Boolean(row);
+async function isSeeded(client: CamusClient): Promise<boolean> {
+  const row = await client.queryOne<{ value: string }>('SELECT value FROM app_metadata WHERE meta_key = @key', {
+    key: SEED_KEY,
+  });
+  return row !== undefined;
 }
 
-export async function seedIfNeeded(): Promise<void> {
-  if (await isSeeded()) return;
+/** Inserts the passenger unless one with the same email is there. Returns its id. */
+async function ensurePassenger(client: CamusClient, passenger: (typeof passengers)[number]): Promise<string> {
+  const existing = await client.queryOne<{ id: string }>('SELECT id FROM passengers WHERE email = @email', {
+    email: passenger.email,
+  });
+  if (existing) return existing.id;
 
+  const id = CamusObjectId.generateAsString();
+  await client.insert('passengers', { id: camus.id(id), name: passenger.name, email: passenger.email });
+  return id;
+}
+
+/** Inserts the flight unless one with the same number is there. Returns its id. */
+async function ensureFlight(client: CamusClient, flight: SeedFlight, now: number): Promise<string> {
+  const existing = await client.queryOne<{ id: string }>('SELECT id FROM flights WHERE flight_number = @flightNumber', {
+    flightNumber: flight.flightNumber,
+  });
+  if (existing) return existing.id;
+
+  const id = CamusObjectId.generateAsString();
+  const departsAt = new Date(now + flight.departOffsetHours * 3_600_000);
+  const arrivesAt = new Date(departsAt.getTime() + flight.durationHours * 3_600_000);
+  await client.insert('flights', {
+    id: camus.id(id),
+    flight_number: flight.flightNumber,
+    airline: flight.airline,
+    origin: flight.origin,
+    destination: flight.destination,
+    departs_at: departsAt,
+    arrives_at: arrivesAt,
+    cabin: flight.cabin,
+    fare: camus.float64(flight.fare),
+    seats_total: flight.seats,
+    seats_available: flight.seats,
+    status: 'scheduled',
+    created_at: new Date(),
+  });
+  return id;
+}
+
+/** A confirmed booking from "before the demo", so the board is not empty on first boot. */
+async function insertHistoricalBooking(client: CamusClient, passengerId: string, flightId: string, seats: number): Promise<void> {
+  await client.transaction(async (txn) => {
+    const flight = await client.queryOne<{ fare: number }>(
+      'SELECT fare FROM flights WHERE id = @id',
+      { id: camus.id(flightId) },
+      { transaction: txn },
+    );
+    if (!flight) return;
+
+    const bookingId = CamusObjectId.generateAsString();
+    await client.execute(
+      'UPDATE flights SET seats_available = seats_available - @seats WHERE id = @id',
+      { seats, id: camus.id(flightId) },
+      { transaction: txn },
+    );
+    await client.insert(
+      'bookings',
+      {
+        id: camus.id(bookingId),
+        passenger_id: camus.id(passengerId),
+        flight_id: camus.id(flightId),
+        seats,
+        total: camus.float64(flight.fare * seats),
+        status: 'confirmed',
+        pnr: `SEED${seats}${crypto.randomUUID().slice(0, 2).toUpperCase()}`.slice(0, 6),
+        idempotency_key: `seed-${bookingId}`,
+        created_at: new Date(),
+      },
+      { transaction: txn },
+    );
+    await recordEvent(client, txn, { bookingId, flightId, eventType: 'reserved', seats });
+  });
+}
+
+/**
+ * Fills an empty database with demo data. Each step checks what is there first, so a seed that
+ * stopped halfway continues on the next start. The `seeded_at` row marks the end.
+ */
+export async function seedIfNeeded(): Promise<void> {
   const client = getClient();
+  if (await isSeeded(client)) return;
+
   const now = Date.now();
   const passengerIds: string[] = [];
+  for (const passenger of passengers) passengerIds.push(await ensurePassenger(client, passenger));
+
   const flightIds: string[] = [];
+  for (const flight of flights) flightIds.push(await ensureFlight(client, flight, now));
 
-  for (const passenger of passengers) {
-    const existing = await client.queryOne<{ id: string }>(
-      'SELECT id FROM passengers WHERE email = @email',
-      { email: passenger.email },
-    );
-    if (existing) {
-      passengerIds.push(existing.id);
-      continue;
-    }
-    const id = CamusObjectId.generateAsString();
-    passengerIds.push(id);
-    await client.insert('passengers', {
-      id: camus.id(id),
-      name: passenger.name,
-      email: passenger.email,
-    });
+  const bookingCount = (await client.scalar<number>('SELECT COUNT(*) FROM bookings')) ?? 0;
+  if (bookingCount === 0) {
+    await insertHistoricalBooking(client, passengerIds[0]!, flightIds[0]!, 1);
+    await insertHistoricalBooking(client, passengerIds[1]!, flightIds[4]!, 2);
   }
 
-  for (const flight of flights) {
-    const existing = await client.queryOne<{ id: string }>(
-      'SELECT id FROM flights WHERE flight_number = @flightNumber',
-      { flightNumber: flight.flightNumber },
-    );
-    if (existing) {
-      flightIds.push(existing.id);
-      continue;
-    }
-    const id = CamusObjectId.generateAsString();
-    flightIds.push(id);
-    const departsAt = new Date(now + flight.departOffsetHours * 3_600_000);
-    const arrivesAt = new Date(departsAt.getTime() + flight.durationHours * 3_600_000);
-    await client.insert('flights', {
-      id: camus.id(id),
-      flight_number: flight.flightNumber,
-      airline: flight.airline,
-      origin: flight.origin,
-      destination: flight.destination,
-      departs_at: departsAt,
-      arrives_at: arrivesAt,
-      cabin: flight.cabin,
-      fare: camus.float64(flight.fare),
-      seats_total: flight.seats,
-      seats_available: flight.seats,
-      status: 'scheduled',
-      created_at: new Date(),
-    });
-  }
-
-  const existingBookings = Number((await client.scalar<number | bigint>('SELECT COUNT(*) FROM bookings')) ?? 0);
-  if (existingBookings === 0) {
-  const historical = [
-    { passenger: passengerIds[0], flight: flightIds[0], seats: 1 },
-    { passenger: passengerIds[1], flight: flightIds[4], seats: 2 },
-  ];
-
-  for (const item of historical) {
-    const flight = await client.queryOne<FlightRow>(
-      'SELECT id, fare, seats_available FROM flights WHERE id = @id',
-      { id: camus.id(item.flight) },
-    );
-    if (!flight) continue;
-
-    await using txn = await client.beginTransaction();
-    try {
-      const bookingId = CamusObjectId.generateAsString();
-      await client.execute(
-        'UPDATE flights SET seats_available = @seats WHERE id = @id',
-        { seats: Number(flight.seats_available) - item.seats, id: camus.id(item.flight) },
-        { transaction: txn },
-      );
-      await client.insert(
-        'bookings',
-        {
-          id: camus.id(bookingId),
-          passenger_id: camus.id(item.passenger),
-          flight_id: camus.id(item.flight),
-          seats: item.seats,
-          total: camus.float64(flight.fare * item.seats),
-          status: 'confirmed',
-          pnr: `SEED${item.seats}${crypto.randomUUID().slice(0, 2).toUpperCase()}`.slice(0, 6),
-          idempotency_key: `seed-${bookingId}`,
-          created_at: new Date(),
-        },
-        { transaction: txn },
-      );
-      await client.insert(
-        'booking_events',
-        {
-          id: camus.id(CamusObjectId.generateAsString()),
-          booking_id: camus.id(bookingId),
-          flight_id: camus.id(item.flight),
-          event_type: 'reserved',
-          seats: item.seats,
-          created_at: new Date(),
-        },
-        { transaction: txn },
-      );
-      await txn.commit();
-    } catch (error) {
-      await txn.rollback();
-      throw error;
-    }
-  }
-  }
-
-  const seeded = await client.queryOne<{ value: string }>(
-    'SELECT value FROM app_metadata WHERE meta_key = @key',
-    { key: SEED_KEY },
-  );
-  if (!seeded) {
-    await client.insert('app_metadata', {
-      meta_key: SEED_KEY,
-      value: new Date().toISOString(),
-    });
+  try {
+    await client.insert('app_metadata', { meta_key: SEED_KEY, value: new Date().toISOString() });
+  } catch (error) {
+    // Two processes seeded at the same time, and the other one wrote the marker first.
+    if (!(await isSeeded(client))) throw error;
   }
 }
 
 export async function getSeedSummary(): Promise<SeedSummary> {
-  const client = getClient();
-  const passengersResult = await client.query<PassengerRow>('SELECT id, name, email FROM passengers ORDER BY name');
-  const flightsResult = await client.query<FlightRow>(
-    `SELECT id, flight_number, airline, origin, destination, departs_at, arrives_at,
-            cabin, fare, seats_total, seats_available, status, created_at
-     FROM flights ORDER BY departs_at`,
-  );
-  const bookingCount = (await client.scalar<number | bigint>('SELECT COUNT(*) FROM bookings')) ?? 0;
-
-  return {
-    passengers: passengersResult.rows.map(mapPassenger),
-    flights: flightsResult.rows.map(mapFlight),
-    bookingCount: Number(bookingCount),
-  };
+  const [passengerList, flightList, bookingCount] = await Promise.all([
+    listPassengers(),
+    listFlights(),
+    getClient().scalar<number>('SELECT COUNT(*) FROM bookings'),
+  ]);
+  return { passengers: passengerList, flights: flightList, bookingCount: bookingCount ?? 0 };
 }

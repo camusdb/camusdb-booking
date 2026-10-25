@@ -23,7 +23,7 @@ export default function LabPage() {
   const [passengers, setPassengers] = useState<Passenger[]>([]);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [orphans, setOrphans] = useState<OrphanInfo[]>([]);
-  const [branchName, setBranchName] = useState('what-if-inventory');
+  const [branchName, setBranchName] = useState('what_if_inventory');
   const [current, setCurrent] = useState(getDatabase());
   const [flightId, setFlightId] = useState('');
   const [passengerId, setPassengerId] = useState('');

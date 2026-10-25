@@ -1,7 +1,6 @@
-import { CamusClient, CamusObjectId, camus } from 'camusdb';
 import { expect, it } from 'vitest';
 import { bootstrap } from '@/lib/camus/bootstrap';
-import { getClient, rootDatabase } from '@/lib/camus/client';
+import { rootDatabase } from '@/lib/camus/client';
 import { LEASE_MS, processOutbox } from '@/lib/outbox/relay';
 import type { GatewayEvent, PaymentIntent, Refund } from '@/lib/payments/gateway';
 import { GatewayRequestError, type PaymentGatewayClient } from '@/lib/payments/gateway-client';
@@ -9,16 +8,7 @@ import { cancelBooking, createBooking, getBooking, getFlight, listPassengers } f
 import { handleGatewayEvent } from '@/lib/services/payments';
 import type { OutboxMessage } from '@/lib/types';
 import { listOutbox } from '@/lib/outbox/outbox';
-
-const endpoint = process.env.CAMUS_ENDPOINT || 'http://localhost:5095';
-
-async function camusUp(): Promise<boolean> {
-  try {
-    return await new CamusClient({ endpoint, database: rootDatabase(), timeoutSeconds: 3 }).ping();
-  } catch {
-    return false;
-  }
-}
+import { camusUp, newFlight } from '@/test/helpers';
 
 const available = await camusUp();
 
@@ -72,28 +62,6 @@ function event(type: GatewayEvent['type'], intent: PaymentIntent): GatewayEvent 
       },
     },
   };
-}
-
-/** Each test gets its own flight, so runs never compete for seats. */
-async function newFlight(seats: number): Promise<string> {
-  const id = CamusObjectId.generateAsString();
-  const departs = new Date(Date.now() + 86_400_000);
-  await getClient().insert('flights', {
-    id: camus.id(id),
-    flight_number: `T${id.slice(-8)}`,
-    airline: 'Test Air',
-    origin: 'AAA',
-    destination: 'BBB',
-    departs_at: departs,
-    arrives_at: new Date(departs.getTime() + 3_600_000),
-    cabin: 'economy',
-    fare: camus.float64(100),
-    seats_total: seats,
-    seats_available: seats,
-    status: 'scheduled',
-    created_at: new Date(),
-  });
-  return id;
 }
 
 async function book(flightId: string, seats = 1) {

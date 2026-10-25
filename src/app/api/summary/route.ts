@@ -1,7 +1,7 @@
 import { withCamus } from '@/lib/http';
 import { getSeedSummary } from '@/lib/camus/seed';
 import { ping } from '@/lib/camus/admin';
-import { currentDatabase } from '@/lib/camus/context';
+import { currentDatabase } from '@/lib/camus/client';
 
 export const runtime = 'nodejs';
 

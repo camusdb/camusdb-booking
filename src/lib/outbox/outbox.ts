@@ -31,7 +31,7 @@ export interface OutboxPayloads {
  */
 export async function enqueue<T extends OutboxTopic>(
   client: CamusClient,
-  transaction: CamusTransaction,
+  txn: CamusTransaction,
   topic: T,
   aggregateId: string,
   payload: OutboxPayloads[T],
@@ -52,17 +52,17 @@ export async function enqueue<T extends OutboxTopic>(
       created_at: now,
       updated_at: now,
     },
-    { transaction },
+    { transaction: txn },
   );
   return id;
 }
 
 export async function listOutbox(limit = 20): Promise<OutboxMessage[]> {
-  const take = Math.min(Math.max(limit, 1), 100);
-  const { rows } = await getClient().query<OutboxRow>(`${outboxSelect} ORDER BY created_at DESC LIMIT ${take}`);
+  const take = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
+  const { rows } = await getClient().query<OutboxRow>(`${outboxSelect} ORDER BY created_at DESC LIMIT @take`, { take });
   return rows.map(mapOutbox);
 }
 
 export async function countOutbox(): Promise<number> {
-  return Number((await getClient().scalar<number | bigint>('SELECT COUNT(*) FROM outbox')) ?? 0);
+  return (await getClient().scalar<number>('SELECT COUNT(*) FROM outbox')) ?? 0;
 }

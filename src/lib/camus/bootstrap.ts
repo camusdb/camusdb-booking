@@ -3,6 +3,11 @@ import { seedIfNeeded } from './seed';
 
 let bootstrapped: Promise<void> | undefined;
 
+/**
+ * Creates the database, the schema, and the demo data, one time for each process. Every route handler
+ * awaits it, so the first request after the CamusDB node comes up does the work. A failed attempt is
+ * forgotten, and the next call tries again.
+ */
 export function bootstrap(): Promise<void> {
   bootstrapped ??= (async () => {
     try {
@@ -16,13 +21,4 @@ export function bootstrap(): Promise<void> {
   })();
 
   return bootstrapped;
-}
-
-export async function register(): Promise<void> {
-  if (process.env.NEXT_RUNTIME === 'edge') return;
-  try {
-    await bootstrap();
-  } catch {
-    // The app still starts; API routes surface the error until CamusDB is reachable.
-  }
 }

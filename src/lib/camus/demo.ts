@@ -11,6 +11,15 @@ import type {
   IdempotencyDemoResult,
 } from '../types';
 
+async function countEvents(): Promise<number> {
+  return (await getClient().scalar<number>('SELECT COUNT(*) FROM booking_events')) ?? 0;
+}
+
+/**
+ * Starts `concurrency` one-seat bookings on one flight at the same time. The bookings that lose the
+ * race for a seat conflict, and `client.transaction` retries them. The retry then reads the new seat
+ * count, so the flight never sells more seats than it has.
+ */
 export async function runConcurrentBookings(
   flightId: string,
   passengerId: string,
@@ -44,6 +53,7 @@ export async function runConcurrentBookings(
   };
 }
 
+/** Sends the same booking request, with one idempotency key, several times at once. One booking results. */
 export async function runIdempotencyDemo(
   request: CreateBookingRequest,
   requestCount = 3,
@@ -56,13 +66,14 @@ export async function runIdempotencyDemo(
   return { requests: requestCount, bookings: distinct, booking: bookings[0] };
 }
 
+/** Runs a booking that throws at `failurePoint`, and counts what the rollback left behind. */
 export async function injectFailure(
   request: CreateBookingRequest,
   failurePoint: FailurePoint,
 ): Promise<FailureInjectionResult> {
   const before = await getFlight(request.flightId);
   if (!before) throw new HttpError(404, 'Flight not found.');
-  const eventsBefore = Number((await getClient().scalar<number | bigint>('SELECT COUNT(*) FROM booking_events')) ?? 0);
+  const eventsBefore = await countEvents();
   const outboxBefore = await countOutbox();
 
   let rolledBack = false;
@@ -73,7 +84,7 @@ export async function injectFailure(
   }
 
   const after = await getFlight(request.flightId);
-  const eventsAfter = Number((await getClient().scalar<number | bigint>('SELECT COUNT(*) FROM booking_events')) ?? 0);
+  const eventsAfter = await countEvents();
   const outboxAfter = await countOutbox();
 
   return {

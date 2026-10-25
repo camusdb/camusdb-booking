@@ -1,11 +1,22 @@
-import { CamusObjectId, camus, withRetry, type CamusClient, type CamusTransaction } from 'camusdb';
+import { CamusObjectId, camus, type CamusClient, type CamusTransaction } from 'camusdb';
 import { getClient } from '../camus/client';
 import { maybeFail } from '../camus/context';
-import { bookingSelect, flightSelect, mapBooking, mapFlight, mapPassenger, type BookingRow, type FlightRow, type PassengerRow } from '../camus/map';
+import {
+  bookingSelect,
+  flightSelect,
+  mapBooking,
+  mapFlight,
+  mapPassenger,
+  passengerSelect,
+  type BookingRow,
+  type FlightRow,
+  type PassengerRow,
+} from '../camus/map';
 import { HttpError, isUniqueViolation } from '../errors';
 import { enqueue } from '../outbox/outbox';
 import { wakeRelay } from '../outbox/relay';
 import { paymentMethods } from '../payments/gateway';
+import { recordEvent } from './events';
 import { findPayment } from './payments';
 import type { Booking, BookingDetail, CreateBookingRequest, Flight, Passenger, PaymentMethod } from '../types';
 
@@ -17,10 +28,12 @@ export function generatePnr(): string {
   return Array.from(bytes, (byte) => PNR_ALPHABET[byte % PNR_ALPHABET.length]).join('');
 }
 
+// ─── Reads ───────────────────────────────────────────────────────────────────
+//
+// A statement without a `transaction` option runs in its own short transaction (autocommit).
+
 export async function listPassengers(): Promise<Passenger[]> {
-  const { rows } = await getClient().query<PassengerRow>(
-    'SELECT id, name, email FROM passengers ORDER BY name',
-  );
+  const { rows } = await getClient().query<PassengerRow>(`${passengerSelect} ORDER BY name`);
   return rows.map(mapPassenger);
 }
 
@@ -30,23 +43,19 @@ export async function listFlights(): Promise<Flight[]> {
 }
 
 export async function getFlight(id: string): Promise<Flight | undefined> {
-  const row = await getClient().queryOne<FlightRow>(`${flightSelect} WHERE id = @id`, {
-    id: camus.id(id),
-  });
+  // `camus.id` binds the string as an ObjectId. A plain string would bind as STRING, which never
+  // equals an OID column.
+  const row = await getClient().queryOne<FlightRow>(`${flightSelect} WHERE id = @id`, { id: camus.id(id) });
   return row ? mapFlight(row) : undefined;
 }
 
 export async function listBookings(flightId?: string): Promise<Booking[]> {
   const client = getClient();
-  if (flightId) {
-    const { rows } = await client.query<BookingRow>(
-      `${bookingSelect} WHERE flight_id = @flightId ORDER BY created_at DESC`,
-      { flightId: camus.id(flightId) },
-    );
-    return rows.map(mapBooking);
-  }
-
-  const { rows } = await client.query<BookingRow>(`${bookingSelect} ORDER BY created_at DESC`);
+  const { rows } = flightId
+    ? await client.query<BookingRow>(`${bookingSelect} WHERE flight_id = @flightId ORDER BY created_at DESC`, {
+        flightId: camus.id(flightId),
+      })
+    : await client.query<BookingRow>(`${bookingSelect} ORDER BY created_at DESC`);
   return rows.map(mapBooking);
 }
 
@@ -57,35 +66,31 @@ export async function getBooking(id: string): Promise<BookingDetail | undefined>
   return { ...mapBooking(row), payment: (await findPayment(client, id)) ?? null };
 }
 
-async function findByIdempotencyKey(
-  client: CamusClient,
-  key: string,
-  transaction?: CamusTransaction,
-): Promise<Booking | undefined> {
-  const row = await client.queryOne<BookingRow>(
-    `${bookingSelect} WHERE idempotency_key = @key`,
-    { key },
-    transaction ? { transaction } : undefined,
-  );
-  return row ? mapBooking(row) : undefined;
-}
+// ─── Create ──────────────────────────────────────────────────────────────────
 
 /**
  * Returns the booking that an earlier request with this key made. A key identifies one request, so a
  * key sent again with other parameters is refused instead of answered with a booking the caller did not
  * ask for. Seed bookings have no payment row, so their payment method is not compared.
+ *
+ * With `txn`, the reads run inside that transaction. Without it, each read runs on its own.
  */
 async function replayFor(
   client: CamusClient,
   request: CreateBookingRequest,
   paymentMethod: PaymentMethod,
   key: string,
-  transaction?: CamusTransaction,
+  txn?: CamusTransaction,
 ): Promise<Booking | undefined> {
-  const existing = await findByIdempotencyKey(client, key, transaction);
-  if (!existing) return undefined;
+  const row = await client.queryOne<BookingRow>(
+    `${bookingSelect} WHERE idempotency_key = @key`,
+    { key },
+    { transaction: txn },
+  );
+  if (!row) return undefined;
 
-  const payment = await findPayment(client, existing.id, transaction);
+  const existing = mapBooking(row);
+  const payment = await findPayment(client, existing.id, txn);
   const same =
     existing.passengerId === request.passengerId &&
     existing.flightId === request.flightId &&
@@ -100,6 +105,17 @@ async function replayFor(
   return existing;
 }
 
+/**
+ * Holds seats on a flight and asks for the payment, in one serializable transaction:
+ *
+ * 1. Read the passenger and the flight, and check the seats.
+ * 2. Take the seats from the flight.
+ * 3. Insert the booking (`pending_payment`), its payment row, and a `reserved` event.
+ * 4. Insert a `payment.requested` outbox message. The relay sends it to the gateway after the commit.
+ *
+ * Every step commits, or none does. The lab's failure points (`maybeFail`) throw between the steps to
+ * show it.
+ */
 export async function createBooking(request: CreateBookingRequest): Promise<Booking> {
   if (!Number.isInteger(request.seats) || request.seats <= 0) {
     throw new HttpError(400, 'Seat count must be a positive integer.');
@@ -112,22 +128,23 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
   const idempotencyKey = request.idempotencyKey?.trim() || crypto.randomUUID().replaceAll('-', '');
   const client = getClient();
 
+  // A retry of a request that already committed gets its booking back without a transaction.
   const existing = await replayFor(client, request, paymentMethod, idempotencyKey);
   if (existing) return existing;
 
+  let booking: Booking;
   try {
-    return await withRetry(async () => {
-    await using txn = await client.beginTransaction();
-
-    try {
+    // `client.transaction` begins a transaction, runs the function, and commits. If the function
+    // throws, it rolls back. If the commit loses a conflict to a concurrent booking, it runs the
+    // whole function again on a new transaction. So the function only reads and writes the
+    // database: a side effect here (an HTTP call, `wakeRelay`) could happen more than one time.
+    booking = await client.transaction(async (txn) => {
+      // Look again inside the transaction: a request with the same key can commit after the check above.
       const replay = await replayFor(client, request, paymentMethod, idempotencyKey, txn);
-      if (replay) {
-        await txn.rollback();
-        return replay;
-      }
+      if (replay) return replay;
 
       const passenger = await client.queryOne<PassengerRow>(
-        'SELECT id, name, email FROM passengers WHERE id = @id',
+        `${passengerSelect} WHERE id = @id`,
         { id: camus.id(request.passengerId) },
         { transaction: txn },
       );
@@ -142,26 +159,29 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
       if (flight.status !== 'scheduled' && flight.status !== 'boarding') {
         throw new HttpError(400, 'Flight is not open for booking.');
       }
-
-      const available = Number(flight.seats_available);
       maybeFail('afterRead');
 
-      if (available < request.seats) {
+      // The transaction is serializable, so no other transaction can change this count before the
+      // commit. Two bookings that race for the last seat conflict, and the retry of the loser reads
+      // the new count.
+      if (flight.seats_available < request.seats) {
         throw new HttpError(400, 'Not enough seats remaining.');
       }
 
       await client.execute(
-        'UPDATE flights SET seats_available = @seats WHERE id = @id',
-        { seats: available - request.seats, id: camus.id(flight.id) },
+        'UPDATE flights SET seats_available = seats_available - @seats WHERE id = @id',
+        { seats: request.seats, id: camus.id(flight.id) },
         { transaction: txn },
       );
       maybeFail('afterSeatHold');
 
       const bookingId = CamusObjectId.generateAsString();
+      const paymentId = CamusObjectId.generateAsString();
       const now = new Date();
       const total = flight.fare * request.seats;
       const pnr = generatePnr();
 
+      // `insert` writes one row from a column-to-value map, with no SQL text to compose.
       await client.insert(
         'bookings',
         {
@@ -169,6 +189,7 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
           passenger_id: camus.id(request.passengerId),
           flight_id: camus.id(request.flightId),
           seats: request.seats,
+          // A whole number such as 642 binds as INT64. `camus.float64` states the column's type.
           total: camus.float64(total),
           status: 'pending_payment',
           pnr,
@@ -178,7 +199,6 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
         { transaction: txn },
       );
 
-      const paymentId = CamusObjectId.generateAsString();
       await client.insert(
         'payments',
         {
@@ -196,18 +216,7 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
       );
       maybeFail('beforeEventInsert');
 
-      await client.insert(
-        'booking_events',
-        {
-          id: camus.id(CamusObjectId.generateAsString()),
-          booking_id: camus.id(bookingId),
-          flight_id: camus.id(request.flightId),
-          event_type: 'reserved',
-          seats: request.seats,
-          created_at: now,
-        },
-        { transaction: txn },
-      );
+      await recordEvent(client, txn, { bookingId, flightId: request.flightId, eventType: 'reserved', seats: request.seats });
       maybeFail('beforeOutboxInsert');
 
       await enqueue(client, txn, 'payment.requested', bookingId, {
@@ -220,8 +229,6 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
       });
       maybeFail('beforeCommit');
 
-      await txn.commit();
-      wakeRelay();
       return {
         id: bookingId,
         passengerId: request.passengerId,
@@ -233,73 +240,56 @@ export async function createBooking(request: CreateBookingRequest): Promise<Book
         idempotencyKey,
         createdAt: now.toISOString(),
       };
-    } catch (error) {
-      await txn.rollback();
-      throw error;
-    }
     });
   } catch (error) {
+    // Two requests with one key both found no booking, and the unique index refused the second
+    // insert. The first one committed, so answer with its booking.
     if (isUniqueViolation(error)) {
-      const booking = await replayFor(client, request, paymentMethod, idempotencyKey);
-      if (booking) return booking;
+      const replay = await replayFor(client, request, paymentMethod, idempotencyKey);
+      if (replay) return replay;
     }
     throw error;
   }
+
+  // The outbox message is committed now, so the relay can send it.
+  wakeRelay();
+  return booking;
 }
 
+// ─── Cancel ──────────────────────────────────────────────────────────────────
+
+/** Cancels a confirmed booking, gives its seats back, and asks for a refund in the same transaction. */
 export async function cancelBooking(id: string): Promise<Booking> {
   const client = getClient();
-  return withRetry(async () => {
-  await using txn = await client.beginTransaction();
 
-  try {
-    const booking = await client.queryOne<BookingRow>(
+  const { booking, refunding } = await client.transaction(async (txn) => {
+    const row = await client.queryOne<BookingRow>(
       `${bookingSelect} WHERE id = @id`,
       { id: camus.id(id) },
       { transaction: txn },
     );
-    if (!booking) throw new HttpError(404, 'Booking not found.');
-    if (booking.status === 'cancelled') throw new HttpError(400, 'Booking is already cancelled.');
-    if (booking.status === 'pending_payment') {
+    if (!row) throw new HttpError(404, 'Booking not found.');
+    if (row.status === 'cancelled') throw new HttpError(400, 'Booking is already cancelled.');
+    if (row.status === 'pending_payment') {
       throw new HttpError(409, 'The payment for this booking is still in progress. Try again when it completes.');
     }
-    if (booking.status !== 'confirmed') throw new HttpError(400, `A ${booking.status} booking cannot be cancelled.`);
+    if (row.status !== 'confirmed') throw new HttpError(400, `A ${row.status} booking cannot be cancelled.`);
 
-    const flight = await client.queryOne<FlightRow>(
-      `${flightSelect} WHERE id = @id`,
-      { id: camus.id(booking.flight_id) },
-      { transaction: txn },
-    );
-    if (!flight) throw new HttpError(404, 'Flight not found.');
-
-    const seats = Number(booking.seats);
     await client.execute(
-      "UPDATE bookings SET status = @status WHERE id = @id",
+      'UPDATE bookings SET status = @status WHERE id = @id',
       { status: 'cancelled', id: camus.id(id) },
       { transaction: txn },
     );
     await client.execute(
-      'UPDATE flights SET seats_available = @seats WHERE id = @id',
-      { seats: Number(flight.seats_available) + seats, id: camus.id(flight.id) },
+      'UPDATE flights SET seats_available = seats_available + @seats WHERE id = @id',
+      { seats: row.seats, id: camus.id(row.flight_id) },
       { transaction: txn },
     );
-    await client.insert(
-      'booking_events',
-      {
-        id: camus.id(CamusObjectId.generateAsString()),
-        booking_id: camus.id(id),
-        flight_id: camus.id(flight.id),
-        event_type: 'cancelled',
-        seats,
-        created_at: new Date(),
-      },
-      { transaction: txn },
-    );
+    await recordEvent(client, txn, { bookingId: id, flightId: row.flight_id, eventType: 'cancelled', seats: row.seats });
 
     // A paid booking gets its money back through the outbox, in the same transaction as the cancel.
     const payment = await findPayment(client, id, txn);
-    const refunding = payment?.status === 'succeeded';
-    if (payment && refunding) {
+    if (payment?.status === 'succeeded') {
       await client.execute(
         'UPDATE payments SET status = @status, updated_at = @now WHERE id = @id',
         { status: 'refund_pending', now: new Date(), id: camus.id(payment.id) },
@@ -313,12 +303,9 @@ export async function cancelBooking(id: string): Promise<Booking> {
       });
     }
 
-    await txn.commit();
-    if (refunding) wakeRelay();
-    return { ...mapBooking(booking), status: 'cancelled' };
-  } catch (error) {
-    await txn.rollback();
-    throw error;
-  }
+    return { booking: { ...mapBooking(row), status: 'cancelled' as const }, refunding: payment?.status === 'succeeded' };
   });
+
+  if (refunding) wakeRelay();
+  return booking;
 }
