@@ -164,7 +164,7 @@ gateway ──▶ POST /api/webhooks/payments           Gateway-Signature: t=…
 webhook ──txn──▶ booking confirmed | payment_failed (seats released) + processed_webhooks
 ```
 
-- **Relay** — runs in the Next.js server process, started from `src/instrumentation.ts`. It claims due messages with a 5 s lease, so a relay that dies loses its claim and another pass takes the message again. A failed call retries with exponential backoff; after 5 attempts, or on a request the gateway rejects, the message becomes `dead` and the booking's hold is released. It also drains every branch of the database.
+- **Relay** — runs in the Next.js server process, started from `src/instrumentation-node.ts`. It claims due messages with a 5 s lease, so a relay that dies loses its claim and another pass takes the message again. A failed call retries with exponential backoff; after 5 attempts, or on a request the gateway rejects, the message becomes `dead` and the booking's hold is released. It also drains every branch of the database.
 - **Idempotency** — the outbox id is the gateway idempotency key, so a message sent twice (after a relay crash) creates one payment intent. The webhook handler stores each event id in `processed_webhooks` in the same transaction as its change, so a duplicate delivery changes nothing.
 - **Fake gateway** — Stripe-shaped `payment_intents` and `refunds` endpoints under `/api/gateway/v1`, with Stripe test payment methods: `pm_card_visa` succeeds, `pm_card_chargeDeclined` and `pm_card_chargeDeclinedInsufficientFunds` fail. It keeps its state in memory, so a restart clears it. Webhooks that do not get a 2xx answer are sent again with backoff.
 - **Refunds** — cancelling a paid booking writes a `refund.requested` message in the cancel transaction. A payment that succeeds after its hold ended (for example, after the relay gave up on a call the gateway did process) is refunded the same way. A booking whose payment is still in progress cannot be cancelled (409).
@@ -177,7 +177,8 @@ The **Payments and outbox** panel in the lab shows the outbox, the gateway's int
 src/
   app/                Next.js App Router pages and route handlers
   components/         Header, lab payments panel
-  instrumentation.ts  Bootstraps CamusDB and starts the outbox relay
+  instrumentation.ts  Next.js startup hook; loads the Node.js part only in the Node.js runtime
+  instrumentation-node.ts  Bootstraps CamusDB and starts the outbox relay
   lib/camus/          Client per database, request context, schema, row types, seed, admin, demos
   lib/outbox/         Outbox writes and the relay
   lib/payments/       Fake gateway, its HTTP client, webhook signatures
