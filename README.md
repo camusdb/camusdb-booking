@@ -213,3 +213,7 @@ Integration tests skip if CamusDB is not reachable. They run against their own `
 ```bash
 npm test
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

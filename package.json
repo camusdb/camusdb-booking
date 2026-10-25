@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Sample Next.js flight-booking app on CamusDB",
+  "license": "MIT",
   "scripts": {
     "dev": "next dev --port 3000",
     "build": "next build",
