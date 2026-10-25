@@ -4,7 +4,7 @@ A Next.js flight-booking demo on **CamusDB** and the [`camusdb`](https://www.npm
 
 It is also a sample of how to use CamusDB from TypeScript. [Learn CamusDB from this code](#learn-camusdb-from-this-code) walks through the patterns, with the file that shows each one.
 
-<img width="995" height="869" alt="booking" src="https://github.com/user-attachments/assets/543c68e8-5b7e-4543-bf83-f46a808c5e71" />
+<img width="1058" height="856" alt="booking" src="https://github.com/user-attachments/assets/86c39ed5-59ca-4409-900a-889b35d43ae2" />
 
 ## Prerequisites
 
